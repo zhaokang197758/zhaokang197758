@@ -28,6 +28,13 @@ DEADLINE = 480       # 取数总时长上限（秒），超时就用已拿到的
 BAR = 200            # 每只取多少根日线（回测要往前推 120 天，别调小）
 HOLD = []            # 兜底持仓，优先读 hold.txt
 
+# ---- 早盘卖出阈值（一夜持股法）----
+SELL_FALL = 3.0      # 从当日最高点回落超过 3% → 全部卖出（冲高失败）
+SELL_BREAK = 3.0     # 跌破昨收 3% → 全部卖出（低开低走）
+STOP_LOSS = 5.0      # 亏损超过 5% → 全部卖出（止损）
+TAKE_ALL = 15.0      # 盈利超过 15% → 全部卖出（落袋）
+TAKE_HALF = 8.0      # 盈利超过 8% → 卖出一半（锁一半利润）
+
 ETF = {"510300": "沪深300ETF", "510500": "中证500ETF", "159915": "创业板ETF",
        "588000": "科创50ETF", "512880": "证券ETF", "512480": "半导体ETF",
        "515030": "新能源车ETF", "512690": "酒ETF", "512170": "医疗ETF",
@@ -35,6 +42,8 @@ ETF = {"510300": "沪深300ETF", "510500": "中证500ETF", "159915": "创业板E
 # ==========================================
 
 NOW = datetime.now(ZoneInfo("Asia/Shanghai"))
+# 模式：morning=早盘只看持仓 | close=收盘选股。按时间自动判断，也可用环境变量强制
+MODE = os.getenv("MODE") or ("morning" if NOW.hour < 12 else "close")
 KEY = (os.getenv("SERVERCHAN_SENDKEY") or "").strip()
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
@@ -91,10 +100,10 @@ def src_em(code, n):                    # 东方财富：国内首选，海外�
 SOURCES = (("腾讯", src_tx), ("新浪", src_sina), ("东财", src_em))
 
 
-def hist(code):
+def hist(code, n=None):
     for name, fn in SOURCES:
         try:
-            rows = fn(code, BAR)
+            rows = fn(code, n or BAR)
             if rows and len(rows) >= MOM_WIN + 5:
                 return rows
         except Exception as e:
@@ -124,22 +133,50 @@ def one(item):
             "_close": close, "_amt": amt}     # 回测用，打印前会删掉
 
 
+def parse_hold(txt):
+    """解析持仓文本：代码,成本价,股数  一行一只，支持 # 注释"""
+    out = []
+    for line in txt.splitlines():
+        t = line.split("#")[0].strip()
+        if not t:
+            continue
+        p = [x for x in t.replace("，", ",").replace("\t", ",").replace(" ", ",").split(",") if x]
+        if not p or len(p[0]) < 6 or not p[0][:6].isdigit():
+            continue
+
+        def num(x):
+            try:
+                return float(x)
+            except Exception:
+                return 0.0
+
+        out.append({"code": p[0][:6],
+                    "cost": num(p[1]) if len(p) > 1 else 0.0,
+                    "shares": int(num(p[2])) if len(p) > 2 else 0})
+    return out
+
+
 def read_hold():
-    """优先读仓库里的 hold.txt（一行一个 6 位代码），失败则用 HOLD 列表"""
+    """优先读本地 hold.txt（Actions checkout 后就在根目录），失败再走网络"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in ("hold.txt", os.path.join(here, "hold.txt")):
+        if os.path.exists(path):
+            try:
+                out = parse_hold(open(path, encoding="utf-8").read())
+                if out:
+                    return out
+            except Exception as e:
+                print("本地 hold.txt 解析失败:", str(e)[:60])
     try:
         repo = os.getenv("GITHUB_REPOSITORY", "zhaokang197758/zhaokang197758")
         u = "https://raw.githubusercontent.com/%s/main/hold.txt" % repo
-        txt = SESSION.get(u, timeout=10).text
-        codes = []
-        for line in txt.splitlines():
-            t = line.split("#")[0].strip()
-            if len(t) >= 6 and t[:6].isdigit():
-                codes.append(t[:6])
-        if codes:
-            return codes
+        out = parse_hold(SESSION.get(u, timeout=10).text)
+        if out:
+            return out
     except Exception as e:
         print("hold.txt 读取失败（持仓诊断可能不准）:", str(e)[:80])
-    return [str(c).strip()[:6] for c in HOLD if str(c).strip()]
+    return [{"code": str(c).strip()[:6], "cost": 0.0, "shares": 0}
+            for c in HOLD if str(c).strip()]
 
 
 def read_pool_file(path):
@@ -263,6 +300,152 @@ def backtest(rows, hold=20, rounds=6):
     return out
 
 
+def quote(codes):
+    """批量取实时报价（腾讯），一次请求拿全部持仓"""
+    if not codes:
+        return {}
+    u = "https://qt.gtimg.cn/q=" + ",".join(px(c) for c in codes)
+    txt = SESSION.get(u, timeout=12).content.decode("gbk", "ignore")
+    out = {}
+    for seg in txt.split(";"):
+        if '="' not in seg:
+            continue
+        body = seg.split('="', 1)[1].strip().strip('"')
+        f = body.split("~")
+        if len(f) < 40 or not f[2] or not f[3]:
+            continue
+        try:
+            out[f[2]] = {"name": f[1], "price": float(f[3]), "prev": float(f[4]),
+                         "open": float(f[5]), "vol": float(f[6]),
+                         "high": float(f[33]), "low": float(f[34]),
+                         "amount": float(f[37]) * 1e4, "time": f[30]}
+        except Exception:
+            continue
+    return out
+
+
+def prev_amount(code):
+    """昨日成交额（元），用来算今天开盘至今的量能进度"""
+    rows = hist(code, 40)   # 不能取太少：数据源有「少于 30 根判无效」的保护
+    if not rows:
+        return 0.0
+    today = NOW.strftime("%Y-%m-%d")
+    for r in reversed(rows):
+        if r[0][:10] < today:
+            return r[2]
+    return 0.0
+
+
+def judge_morning(q, cost, y_amt):
+    """一夜持股：早盘该不该卖。返回 (动作, 理由)"""
+    price, prev, hi = q["price"], q["prev"], q["high"]
+    if price <= 0 or prev <= 0:
+        return "数据异常", "取不到有效价，手动看一眼"
+    chg = (price / prev - 1) * 100
+    pnl = (price / cost - 1) * 100 if cost > 0 else None
+    fall = (hi - price) / hi * 100 if hi > 0 else 0.0
+    vr = q["amount"] / y_amt * 100 if y_amt > 0 else 0.0
+
+    if pnl is not None and pnl <= -STOP_LOSS:
+        return "全部卖出", "亏损 %.1f%%，触及止损线" % abs(pnl)
+    if chg <= -SELL_BREAK:
+        return "全部卖出", "跌破昨收 %.1f%%，低开低走" % abs(chg)
+    if vr >= 60 and chg <= -1.5:
+        return "全部卖出", "放量下跌，量能已到昨日 %d%%" % int(vr)
+    if pnl is not None and pnl >= TAKE_ALL:
+        return "全部卖出", "赚 %.1f%%，到位先落袋" % pnl
+    if fall >= SELL_FALL:
+        return "全部卖出", "从最高回落 %.1f%%，冲高失败" % fall
+    if pnl is not None and pnl >= TAKE_HALF:
+        return "卖出一半", "赚 %.1f%%，先锁一半" % pnl
+    return "继续持有", "涨 %.1f%%，形态没破" % chg
+
+
+def run_morning(holds):
+    """早盘模式：只看持仓，给出卖 / 持决策"""
+    if not holds:
+        push("%s 无持仓" % NOW.strftime("%m-%d"),
+             "## 早盘\n\nhold.txt 里没有记录，今天不用操作。\n\n"
+             "买入后记得把「代码,成本价,股数」写进去。")
+        return
+
+    codes = [h["code"] for h in holds]
+    qt = quote(codes)
+    if not qt:
+        print("实时行情全部失败")
+        sys.exit(1)
+
+    d0 = next(iter(qt.values()))["time"][:8]
+    if d0 != NOW.strftime("%Y%m%d"):
+        print("今日休市（行情日期 %s）" % d0)
+        push("%s 休市" % NOW.strftime("%m-%d"), "## 今天休市\n\n不开盘，不用操作。")
+        return
+
+    rows, tcost, tval = [], 0.0, 0.0
+    for h in holds:
+        q = qt.get(h["code"])
+        if not q:
+            rows.append({"act": "无行情", "name": h["code"], "cost": h["cost"],
+                         "price": 0.0, "pnl": None, "why": "停牌或代码有误"})
+            continue
+        act, why = judge_morning(q, h["cost"], prev_amount(h["code"]))
+        pnl = (q["price"] / h["cost"] - 1) * 100 if h["cost"] > 0 else None
+        if h["cost"] > 0 and h["shares"] > 0:
+            tcost += h["cost"] * h["shares"]
+            tval += q["price"] * h["shares"]
+        rows.append({"act": act, "name": q["name"], "cost": h["cost"],
+                     "price": q["price"], "pnl": pnl, "why": why})
+
+    order = {"全部卖出": 0, "卖出一半": 1, "继续持有": 2, "无行情": 3, "数据异常": 3}
+    rows.sort(key=lambda r: order.get(r["act"], 9))
+
+    act_rows = [r for r in rows if r["act"] in ("全部卖出", "卖出一半")]
+    odd_rows = [r for r in rows if r["act"] in ("无行情", "数据异常")]
+    keep_rows = [r for r in rows if r["act"] == "继续持有"]
+
+    body = []
+    head = "%d 只要动" % len(act_rows) if act_rows else "全部继续持有"
+    body.append("## 【早盘】%s\n" % head)
+    t0 = next(iter(qt.values()))["time"]
+    body.append("行情时间 **%s:%s**　盘中价，不是收盘价\n" % (t0[8:10], t0[10:12]))
+    if not act_rows:
+        body.append("**今天什么都不用做，继续拿着。**\n")
+
+    if act_rows:
+        body.append("**要卖的**\n")
+        for r in act_rows:
+            c_s = "%.2f" % r["cost"] if r["cost"] > 0 else "未填"
+            p_s = "%+.1f%%" % r["pnl"] if r["pnl"] is not None else "—"
+            body.append("- **%s** %s　成本 %s → 现价 %.2f（%s）\n  %s"
+                        % (r["act"], r["name"], c_s, r["price"], p_s, r["why"]))
+
+    if keep_rows:
+        body.append("\n**不用动的**\n")
+        for r in keep_rows:
+            c_s = "%.2f" % r["cost"] if r["cost"] > 0 else "未填"
+            p_s = "%+.1f%%" % r["pnl"] if r["pnl"] is not None else "—"
+            body.append("- %s　成本 %s → 现价 %.2f（%s）　%s"
+                        % (r["name"], c_s, r["price"], p_s, r["why"]))
+
+    if odd_rows:
+        body.append("\n**需要你自己看一眼的**\n")
+        for r in odd_rows:
+            body.append("- %s：%s" % (r["name"], r["why"]))
+
+    if tcost > 0:
+        body.append("\n**合计**：成本 %.0f 元 → 市值 %.0f 元，浮动 **%+.1f%%**"
+                    % (tcost, tval, (tval / tcost - 1) * 100))
+
+    body += ["", "**执行**：10:00 前挂单，卖完把 hold.txt 里那行删掉。",
+             "「继续持有」也别一直盯，收盘那次推送还会再判断一次。"]
+    text = "\n".join(body)
+    print(text)
+
+    title = "%s 早盘 %s" % (NOW.strftime("%m-%d"), head)
+    if not push(title, text):
+        sys.exit(1)
+
+
 def push(title, text):
     """推送，失败重试 3 次。Server酱偶尔 5xx，一次失败就放弃太脆弱"""
     if not KEY:
@@ -282,6 +465,10 @@ def push(title, text):
 
 
 def main():
+    holds = read_hold()
+    if MODE == "morning":
+        run_morning(holds)
+        return
     items = get_pool()
     print("池子 %s，标的 %d，数据源 腾讯/新浪/东财" % (INDEX, len(items)))
 
@@ -331,8 +518,7 @@ def main():
     show = df.drop(columns=["_close", "_amt"])
     print(show.head(SHOW_N).to_string(index=False))
 
-    holds = read_hold()
-    heldset = set(holds)
+    heldset = {h["code"] for h in holds}
     bt = backtest(rows)
 
     # ---- 组装推送 ----
@@ -394,17 +580,32 @@ def main():
     # ---- 持仓诊断 ----
     if holds:
         body += ["", "**你的持仓**", "",
-                 "| 评级 | 代码 | 名称 | 20日动量 | 5日涨幅 | 排名 |",
+                 "| 评级 | 名称 | 成本 | 现价 | 盈亏 | 20日动量 |",
                  "| --- | --- | --- | --- | --- | --- |"]
-        for c in holds:
+        tcost, tval = 0.0, 0.0
+        for h in holds:
+            c = h["code"]
             hit = show[show["code"] == c]
             if hit.empty:
-                body.append("| 卖出 | %s | 不在池内 | — | — | — |" % c)
+                body.append("| **卖出** | %s | %s | — | — | — |"
+                            % (c, ("%.2f" % h["cost"]) if h["cost"] > 0 else "—"))
+                continue
+            r = hit.iloc[0]
+            g = rate(int(r["rank"]), total, r["mom"], r["ret5"], True)
+            if h["cost"] > 0:
+                pnl = (r["close"] / h["cost"] - 1) * 100
+                p_s = "%+.1f%%" % pnl
+                c_s = "%.2f" % h["cost"]
+                if h["shares"] > 0:
+                    tcost += h["cost"] * h["shares"]
+                    tval += r["close"] * h["shares"]
             else:
-                r = hit.iloc[0]
-                g = rate(int(r["rank"]), total, r["mom"], r["ret5"], True)
-                body.append("| **%s** | %s | %s | %+.2f%% | %+.2f%% | %d/%d |"
-                            % (g, r["code"], r["name"], r["mom"], r["ret5"], int(r["rank"]), total))
+                p_s, c_s = "—", "—"
+            body.append("| **%s** | %s | %s | %s | %s | %+.2f%% |"
+                        % (g, r["name"], c_s, r["close"], p_s, r["mom"]))
+        if tcost > 0:
+            body.append("| | **合计** | **%.0f** | **%.0f** | **%+.1f%%** | |"
+                        % (tcost, tval, (tval / tcost - 1) * 100))
 
     body += ["", "**卖出纪律（照做，不要临场判断）**",
              "1. 评级变「减仓」→ 卖一半",
