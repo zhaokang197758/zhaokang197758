@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""每日动量选股信号 -> 微信推送（多数据源版，适配 GitHub 海外服务器）"""
+"""每日动量选股 -> 微信推送（中证800 · 带评级 · 持仓诊断）"""
 
 import os
 import sys
@@ -10,12 +10,17 @@ from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ 参数区：只改这里 ============
-POOL = "hs300"      # hs300 = 沪深300成分股 | etf = 下面的 ETF 池
-TOP_N = 5           # 持有几只
-MOM_WIN = 20        # 动量回看天数
-MAX_RET5 = 0.15     # 剔除 5 日涨幅超 15% 的过热股
-MIN_AMT = 2.0       # 20 日均成交额下限（亿元）
-WORKERS = 4         # 并发数，报错多就改成 2
+INDEX = "000906"     # 000300=沪深300 | 000906=中证800 | 000852=中证1000 | 000985=全A
+POOL = "index"       # index = 用上面的 INDEX | etf = 用下面的 ETF 池
+TOP_N = 5            # 建议建仓几只
+SHOW_N = 15          # 推送展示前几名（前 15 名足够覆盖你的持仓）
+MOM_WIN = 20         # 动量回看天数
+MAX_RET5 = 0.15      # 剔除 5 日涨幅超 15% 的过热股
+MIN_AMT = 2.0        # 20 日均成交额下限（亿元）
+WORKERS = 4          # 并发数，报错多就改成 2
+
+# 你当前持有的股票（6 位代码，逗号分隔）。买入或清仓后改这一行。
+HOLD = []            # 例：["688981", "002311", "600887"]
 
 ETF = {"510300": "沪深300ETF", "510500": "中证500ETF", "159915": "创业板ETF",
        "588000": "科创50ETF", "512880": "证券ETF", "512480": "半导体ETF",
@@ -84,7 +89,7 @@ def hist(code):
                 return rows
         except Exception as e:
             if len(ERR) < 3:
-                ERR.append("%s/%s:%s" % (code, name, str(e)[:50]))
+                ERR.append("%s/%s:%s" % (code, name, str(e)[:40]))
     return None
 
 
@@ -110,16 +115,32 @@ def get_pool():
         return list(ETF.items())
     try:
         import akshare as ak
-        r = ak.index_stock_cons_csindex(symbol="000300")
+        r = ak.index_stock_cons_csindex(symbol=INDEX)
         return [(str(a).zfill(6), str(b)) for a, b in zip(r["成分券代码"], r["成分券名称"])]
     except Exception as e:
         print("成分股获取失败，退回 ETF 池:", str(e)[:80])
         return list(ETF.items())
 
 
+def rate(rank, total, mom, ret5):
+    """评级：买入 / 继续持有 / 减仓 / 卖出"""
+    pct = rank / total
+    if mom < 0:
+        return "卖出"          # 20 日动量为负 = 趋势已破，无条件离场
+    if ret5 < -6:
+        return "减仓"          # 短期破位
+    if ret5 > 12:
+        return "减仓"          # 过热，接近 15% 剔除线，先落袋
+    if pct > 0.10:
+        return "减仓"          # 掉出前 10%，趋势弱化
+    if ret5 > 6:
+        return "继续持有"      # 加速中，持有但不追
+    return "买入"              # 趋势健康
+
+
 def main():
     items = get_pool()
-    print("标的数 %d，数据源顺序 腾讯/新浪/东财" % len(items))
+    print("池子 %s，标的 %d，数据源 腾讯/新浪/东财" % (INDEX, len(items)))
 
     rows = []
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -139,34 +160,71 @@ def main():
         sys.exit(1)
 
     df = pd.DataFrame(rows).sort_values("mom", ascending=False).reset_index(drop=True)
+    total = len(df)
     med = float(df["mom"].median())
-    cand = df.head(max(int(len(df) * 0.1), TOP_N))
+    up = int((df["mom"] > 0).sum())
+    df["rank"] = df.index + 1
+
+    # ---- 目标组合（过滤后取 TOP_N）----
+    cand = df.head(max(int(total * 0.1), TOP_N))
     pick = cand[(cand["ret5"] <= MAX_RET5 * 100) & (cand["amt"] >= MIN_AMT)].head(TOP_N)
     if pick.empty:
         pick = cand.head(TOP_N)
+    print(pick.to_string(index=False))
 
-    lines = ["### %s 目标组合" % NOW.strftime("%m-%d"), "",
-             "| 代码 | 名称 | 收盘 | 20日动量 | 5日涨幅 | 20日均额(亿) |",
-             "| --- | --- | --- | --- | --- | --- |"]
-    for _, r in pick.iterrows():
-        lines.append("| %s | %s | %s | %+.2f%% | %+.2f%% | %.2f |"
-                     % (r["code"], r["name"], r["close"], r["mom"], r["ret5"], r["amt"]))
-    if med < -1:
-        lines += ["", "**弱市**：全池动量中位数 %+.2f%%，建议半仓或空仓（每只≤10%%）。" % med]
+    # ---- 组装推送 ----
+    weak = med < -1
+    head = []
+    if weak:
+        head.append("## 【弱市】建议半仓或空仓\n")
+        head.append("**每只仓位不超过 10%，不要满仓。**\n")
     else:
-        lines += ["", "全池动量中位数 %+.2f%%，建议每只 %d%%。" % (med, 100 // max(len(pick), 1))]
-    lines += ["", "调仓建议：每周一执行，开盘 15 分钟后挂限价单（昨收±1%），不追高。",
-              "", "<sub>数据源：腾讯/新浪/东财 | 仅供参考，不构成投资建议</sub>"]
+        head.append("## 【正常】可按计划建仓\n")
+    head.append("全池动量中位数 **%+.2f%%**，上涨 %d/%d 只（%.0f%%）\n"
+                % (med, up, total, up * 100.0 / total))
 
-    body = "\n".join(lines)
-    print(body)
+    body = ["\n".join(head), "\n**今日目标组合（前 %d 名）**\n" % min(SHOW_N, total),
+            "| 评级 | 代码 | 名称 | 现价 | 20日动量 | 5日涨幅 | 均额亿 |",
+            "| --- | --- | --- | --- | --- | --- | --- |"]
+    for _, r in df.head(SHOW_N).iterrows():
+        g = rate(int(r["rank"]), total, r["mom"], r["ret5"])
+        mark = "**%s**" % g if g in ("买入", "卖出") else g
+        body.append("| %s | %s | %s | %s | %+.2f%% | %+.2f%% | %.2f |"
+                    % (mark, r["code"], r["name"], r["close"], r["mom"], r["ret5"], r["amt"]))
+
+    # ---- 持仓诊断 ----
+    holds = [str(c).strip()[:6] for c in HOLD if str(c).strip()]
+    if holds:
+        body += ["", "**你的持仓**", "",
+                 "| 评级 | 代码 | 名称 | 20日动量 | 5日涨幅 | 排名 |",
+                 "| --- | --- | --- | --- | --- | --- |"]
+        for c in holds:
+            hit = df[df["code"] == c]
+            if hit.empty:
+                body.append("| 卖出 | %s | 不在池内 | — | — | — |" % c)
+            else:
+                r = hit.iloc[0]
+                g = rate(int(r["rank"]), total, r["mom"], r["ret5"])
+                body.append("| **%s** | %s | %s | %+.2f%% | %+.2f%% | %d/%d |"
+                            % (g, r["code"], r["name"], r["mom"], r["ret5"], int(r["rank"]), total))
+
+    body += ["", "**卖出纪律（照做，不要临场判断）**",
+             "1. 评级变「减仓」→ 卖一半",
+             "2. 评级变「卖出」→ 清仓",
+             "3. 组合从最高点回撤 10% → 全部清仓，停止一个月",
+             "", "调仓日：每周一；限价单挂昨收 ±1%，开盘 15 分钟后下单。",
+             "", "<sub>数据源：腾讯/新浪/东财 | 仅供参考，不构成投资建议</sub>"]
+
+    text = "\n".join(body)
+    print(text)
 
     if not KEY:
         print("未配置 SERVERCHAN_SENDKEY，仅打印")
         sys.exit(1)
-    title = ("%s 信号%d只 " % (NOW.strftime("%m-%d"), len(pick))) + "、".join(pick["name"].head(2))
+    title = "%s %s 信号%d只 %s" % (NOW.strftime("%m-%d"), "弱市" if weak else "正常",
+                                   len(pick), "、".join(pick["name"].head(2)))
     r = requests.post("https://sctapi.ftqq.com/%s.send" % KEY,
-                      data={"title": title[:32], "desp": body}, timeout=20)
+                      data={"title": title[:32], "desp": text}, timeout=20)
     print("推送返回 HTTP=%s %s" % (r.status_code, r.text[:200]))
     if r.status_code != 200 or '"errno":0' not in r.text.replace(" ", ""):
         sys.exit(1)
