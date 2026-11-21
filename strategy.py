@@ -110,6 +110,24 @@ def one(item):
             "amt": round(sum(amt[-20:]) / 20 / 1e8, 2)}
 
 
+def read_hold():
+    """优先读仓库里的 hold.txt（一行一个 6 位代码），失败则用 HOLD 列表"""
+    try:
+        repo = os.getenv("GITHUB_REPOSITORY", "zhaokang197758/zhaokang197758")
+        u = "https://raw.githubusercontent.com/%s/main/hold.txt" % repo
+        txt = requests.get(u, headers=UA, timeout=10).text
+        codes = []
+        for line in txt.splitlines():
+            t = line.split("#")[0].strip()
+            if len(t) >= 6 and t[:6].isdigit():
+                codes.append(t[:6])
+        if codes:
+            return codes
+    except Exception:
+        pass
+    return [str(c).strip()[:6] for c in HOLD if str(c).strip()]
+
+
 def get_pool():
     if POOL == "etf":
         return list(ETF.items())
@@ -193,7 +211,7 @@ def main():
                     % (mark, r["code"], r["name"], r["close"], r["mom"], r["ret5"], r["amt"]))
 
     # ---- 持仓诊断 ----
-    holds = [str(c).strip()[:6] for c in HOLD if str(c).strip()]
+    holds = read_hold()
     if holds:
         body += ["", "**你的持仓**", "",
                  "| 评级 | 代码 | 名称 | 20日动量 | 5日涨幅 | 排名 |",
