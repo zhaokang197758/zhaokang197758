@@ -2,7 +2,7 @@ name: daily-signal
 
 on:
   schedule:
-    - cron: "52 1 * * 1-5"    # 北京 09:52 早盘：判断持仓该不该卖
+    - cron: "45 1 * * 1-5"    # 北京 09:45 早盘：持仓该不该卖（留足排队余量）
     - cron: "15 6 * * 1-5"    # 北京 14:15 收盘：选股 + 持仓诊断
   workflow_dispatch:
     inputs:
@@ -26,8 +26,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      # 只要两个包：akshare 已不需要（股票池读固化名单），装它会白等一分半
       - name: 安装依赖
-        run: pip install -q pandas requests && (pip install -q akshare || echo "akshare 不可用，走固化名单")
+        run: pip install -q pandas requests
 
       - name: 生成信号并推送
         env:
