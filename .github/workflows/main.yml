@@ -2,7 +2,7 @@ name: daily-signal
 
 on:
   schedule:
-    - cron: "45 1 * * 1-5"    # 北京 09:45 早盘：持仓该不该卖（留足排队余量）
+    - cron: "0 2 * * 1-5"     # 北京 10:00 早盘：持仓该不该卖
     - cron: "15 6 * * 1-5"    # 北京 14:15 收盘：选股 + 持仓诊断
   workflow_dispatch:
     inputs:
@@ -34,4 +34,5 @@ jobs:
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           MODE: ${{ github.event.inputs.mode }}
+          CRON: ${{ github.event.schedule }}
         run: python strategy.py
