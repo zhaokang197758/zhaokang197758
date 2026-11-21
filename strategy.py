@@ -47,12 +47,13 @@ NOW = datetime.now(ZoneInfo("Asia/Shanghai"))
 # 优先用 MODE 环境变量；其次按「是哪个 cron 触发的」判断；最后才看当前时间。
 # 不能只看小时：10:00 的任务若排队拖到 12 点后才跑，会被误判成收盘模式，去扫 800 只。
 CRON = (os.getenv("CRON") or "").strip()
+_CP = CRON.split()
 if os.getenv("MODE"):
     MODE = os.getenv("MODE").strip()
-elif CRON.startswith("0 2"):
-    MODE = "morning"                    # 北京 10:00 那一档
-elif CRON.startswith("15 6"):
-    MODE = "close"                      # 北京 14:15 那一档
+elif len(_CP) >= 2 and _CP[0] == "0" and _CP[1] == "2":
+    MODE = "morning"                    # 北京 10:00 那一档（UTC 02:00）
+elif len(_CP) >= 2 and _CP[0] == "15" and _CP[1] == "6":
+    MODE = "close"                      # 北京 14:15 那一档（UTC 06:15）
 else:
     MODE = "morning" if NOW.hour < 12 else "close"
 KEY = (os.getenv("SERVERCHAN_SENDKEY") or "").strip()
