@@ -43,8 +43,18 @@ ETF = {"510300": "沪深300ETF", "510500": "中证500ETF", "159915": "创业板E
 # ==========================================
 
 NOW = datetime.now(ZoneInfo("Asia/Shanghai"))
-# 模式：morning=早盘只看持仓 | close=收盘选股。按时间自动判断，也可用环境变量强制
-MODE = os.getenv("MODE") or ("morning" if NOW.hour < 12 else "close")
+# 模式：morning=早盘只看持仓 | close=收盘选股
+# 优先用 MODE 环境变量；其次按「是哪个 cron 触发的」判断；最后才看当前时间。
+# 不能只看小时：10:00 的任务若排队拖到 12 点后才跑，会被误判成收盘模式，去扫 800 只。
+CRON = (os.getenv("CRON") or "").strip()
+if os.getenv("MODE"):
+    MODE = os.getenv("MODE").strip()
+elif CRON.startswith("0 2"):
+    MODE = "morning"                    # 北京 10:00 那一档
+elif CRON.startswith("15 6"):
+    MODE = "close"                      # 北京 14:15 那一档
+else:
+    MODE = "morning" if NOW.hour < 12 else "close"
 KEY = (os.getenv("SERVERCHAN_SENDKEY") or "").strip()
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
@@ -426,7 +436,10 @@ def judge_morning(q, cost, y_amt):
         return "全部卖出", "从当日高点 %.2f 回落 %.1f%%，上攻失败" % (hi, fall)
     if pnl is not None and pnl >= TAKE_HALF:
         return "卖出一半", "赚 %.1f%%，先锁一半" % pnl
-    return "继续持有", "%s %.1f%%，形态没破" % ("涨" if chg >= 0 else "跌", abs(chg))
+    # 没触发卖出时也把量能露出来：10:00 的放量门槛是「正常节奏的 1.8 倍」，
+    # 偏严，给你这个数字，你可以自己判断要不要提前走。
+    vs = "，量能 %.1f 倍" % pace if pace > 0 else ""
+    return "继续持有", "%s %.1f%%，形态没破%s" % ("涨" if chg >= 0 else "跌", abs(chg), vs)
 
 
 def run_morning(holds):
@@ -489,6 +502,13 @@ def run_morning(holds):
     head = "%d 只要动" % len(act_rows) if act_rows else "全部继续持有"
     body.append("## 【早盘】%s\n" % head)
     body.append("行情时间 **%s:%s**　盘中价，不是收盘价\n" % (qtime[8:10], qtime[10:12]))
+    # 10:00 的任务要排队，实际可能 10:08 才跑。不告诉你这一点，你会以为看的是 10:00 的盘。
+    tgt = NOW.replace(hour=10, minute=0, second=0, microsecond=0)
+    late = int((NOW - tgt).total_seconds() // 60)
+    if 5 < late <= 90:
+        body.append("> **比 10:00 晚 %d 分钟启动**，以下是 %s 的价。"
+                    "下单前扫一眼现价，若已明显走样以盘面为准。\n"
+                    % (late, qtime[8:10] + ":" + qtime[10:12]))
     if not act_rows:
         body.append("**今天什么都不用做，继续拿着。**\n")
 
@@ -518,7 +538,7 @@ def run_morning(holds):
         body.append("\n**合计**：成本 %.0f 元 → 市值 %.0f 元，浮动 **%+.1f%%**"
                     % (tcost, tval, (tval / tcost - 1) * 100))
 
-    body += ["", "**执行**：10:00 前挂单，卖完把 hold.txt 里那行删掉。",
+    body += ["", "**执行**：看到就挂单，不用等整点，卖完把 hold.txt 里那行删掉。",
              "「继续持有」也别一直盯，收盘那次推送还会再判断一次。"]
     text = "\n".join(body)
     print(text)
