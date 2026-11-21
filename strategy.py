@@ -11,6 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============ 参数区：只改这里 ============
 INDEX = "000906"     # 000300=沪深300 | 000906=中证800 | 000852=中证1000 | 000985=全A
+INDEX_NAME = {"000300": "沪深300", "000905": "中证500", "000906": "中证800",
+              "000852": "中证1000", "000985": "中证全指"}
 POOL = "index"       # index = 用上面的 INDEX | etf = 用下面的 ETF 池
 TOP_N = 5            # 建议建仓几只
 SHOW_N = 15          # 推送展示前几名（前 15 名足够覆盖你的持仓）
@@ -128,16 +130,50 @@ def read_hold():
     return [str(c).strip()[:6] for c in HOLD if str(c).strip()]
 
 
+def read_pool_file(path):
+    """读固化名单：一行一只，格式 代码,名称，支持 # 注释"""
+    pairs = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                t = line.split("#")[0].strip()
+                if not t:
+                    continue
+                parts = t.replace("\t", ",").replace("，", ",").replace(" ", ",").split(",")
+                c = parts[0].strip()
+                if len(c) >= 6 and c[:6].isdigit():
+                    nm = parts[1].strip() if len(parts) > 1 and parts[1].strip() else c[:6]
+                    pairs.append((c[:6], nm))
+    except Exception:
+        pass
+    return pairs
+
+
 def get_pool():
     if POOL == "etf":
         return list(ETF.items())
+    # 1) 优先读仓库里的固化名单：零网络依赖，绝不会因为接口挂掉而缩水
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in ("pool_%s.txt" % INDEX, os.path.join(here, "pool_%s.txt" % INDEX)):
+        if os.path.exists(path):
+            pairs = read_pool_file(path)
+            if pairs:
+                print("池子来源：固化名单 %s（%d 只）" % (os.path.basename(path), len(pairs)))
+                return pairs
+    # 2) 兜底：在线接口
     try:
         import akshare as ak
         r = ak.index_stock_cons_csindex(symbol=INDEX)
-        return [(str(a).zfill(6), str(b)) for a, b in zip(r["成分券代码"], r["成分券名称"])]
+        pairs = [(str(a).zfill(6), str(b)) for a, b in zip(r["成分券代码"], r["成分券名称"])]
+        if pairs:
+            print("池子来源：在线接口（%d 只）" % len(pairs))
+            return pairs
     except Exception as e:
-        print("成分股获取失败，退回 ETF 池:", str(e)[:80])
-        return list(ETF.items())
+        print("在线成分股获取失败:", str(e)[:100])
+    # 宁可报错停跑，也不退回 ETF 小池子——小池子算出的"全市场中位数"是错的，会误导仓位
+    print("【致命】没有可用股票池，今日不生成信号。")
+    print("请确认仓库根目录存在 pool_%s.txt（800 行左右的代码名单）。" % INDEX)
+    sys.exit(1)
 
 
 def rate(rank, total, mom, ret5):
@@ -231,7 +267,8 @@ def main():
              "2. 评级变「卖出」→ 清仓",
              "3. 组合从最高点回撤 10% → 全部清仓，停止一个月",
              "", "调仓日：每周一；限价单挂昨收 ±1%，开盘 15 分钟后下单。",
-             "", "<sub>数据源：腾讯/新浪/东财 | 仅供参考，不构成投资建议</sub>"]
+             "", "<sub>池子 %s（%d 只）| 数据源：腾讯/新浪/东财 | 仅供参考，不构成投资建议</sub>"
+             % (INDEX_NAME.get(INDEX, INDEX), total)]
 
     text = "\n".join(body)
     print(text)
