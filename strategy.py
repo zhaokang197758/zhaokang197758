@@ -3,6 +3,7 @@
 
 import os
 import sys
+import threading
 import time
 import statistics
 import requests
@@ -48,6 +49,31 @@ KEY = (os.getenv("SERVERCHAN_SENDKEY") or "").strip()
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 ERR = []
+COVER_MIN = 0.70     # 取数覆盖率低于此值，不输出选股信号（避免用残缺数据发假信号）
+SRC_BAN = 15         # 某个源连续失败 N 次后，本次运行不再尝试它
+_LK = threading.Lock()
+SRC_FAIL = {}
+
+
+def _json(r):
+    """只在真的是 JSON 时才解析：WAF 拦截页、空响应一律算失败"""
+    t = (r.text or "").lstrip()
+    if not t or t[0] not in "[{":
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+def s_ban(name):
+    with _LK:
+        return SRC_FAIL.get(name, 0) >= SRC_BAN
+
+
+def s_mark(name, ok):
+    with _LK:
+        SRC_FAIL[name] = 0 if ok else SRC_FAIL.get(name, 0) + 1
 
 # 复用连接：800 只 × 3 源，新连接每次都要握手，慢且容易被风控断连
 SESSION = requests.Session()
@@ -62,7 +88,9 @@ def px(code):
 def src_tx(code, n):                    # 腾讯：海外机房最稳
     u = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=%s,day,,,%d,qfq"
          % (px(code), n))
-    j = SESSION.get(u, timeout=12).json()
+    j = _json(SESSION.get(u, timeout=12))
+    if not j:
+        return None
     d = (j.get("data") or {}).get(px(code)) or {}
     arr = d.get("qfqday") or d.get("day") or []
     if len(arr) < 30:
@@ -75,7 +103,7 @@ def src_tx(code, n):                    # 腾讯：海外机房最稳
 def src_sina(code, n):                  # 新浪：前复权，量单位为「股」
     u = ("https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
          "?symbol=%s&scale=240&ma=no&datalen=%d" % (px(code), n))
-    arr = SESSION.get(u, timeout=12).json()
+    arr = _json(SESSION.get(u, timeout=12))
     if not isinstance(arr, list) or len(arr) < 30:
         return None
     return [(x["day"][:10], float(x["close"]), float(x["volume"]) * float(x["close"]))
@@ -86,7 +114,9 @@ def src_em(code, n):                    # 东方财富：国内首选，海外�
     secid = ("1." if code[0] in "56" else "0.") + code
     u = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s"
          "&fields1=f1,f2,f3&fields2=f51,f53,f57&klt=101&fqt=1&end=20500101&lmt=%d" % (secid, n))
-    j = SESSION.get(u, timeout=12).json()
+    j = _json(SESSION.get(u, timeout=12))
+    if not j:
+        return None
     kl = ((j.get("data") or {}).get("klines")) or []
     if len(kl) < 30:
         return None
@@ -101,12 +131,21 @@ SOURCES = (("腾讯", src_tx), ("新浪", src_sina), ("东财", src_em))
 
 
 def hist(code, n=None):
+    """按顺序尝试各数据源，连续失灵的源本次运行内跳过（避免无谓请求拖慢全局）"""
     for name, fn in SOURCES:
+        if s_ban(name):
+            continue
         try:
             rows = fn(code, n or BAR)
             if rows and len(rows) >= MOM_WIN + 5:
+                s_mark(name, True)
                 return rows
+            s_mark(name, False)
+            if len(ERR) < 4:
+                ERR.append("%s/%s:%s" % (code, name,
+                                         "接口无有效返回" if not rows else "K线不足"))
         except Exception as e:
+            s_mark(name, False)
             if len(ERR) < 3:
                 ERR.append("%s/%s:%s" % (code, name, str(e)[:40]))
     return None
@@ -150,7 +189,11 @@ def parse_hold(txt):
             except Exception:
                 return 0.0
 
-        out.append({"code": p[0][:6],
+        cd = p[0][:6]
+        if any(x["code"] == cd for x in out):
+            print("hold.txt 里 %s 重复，已忽略后面那行" % cd)
+            continue
+        out.append({"code": cd,
                     "cost": num(p[1]) if len(p) > 1 else 0.0,
                     "shares": int(num(p[2])) if len(p) > 2 else 0})
     return out
@@ -249,8 +292,8 @@ def rate(rank, total, mom, ret5, held=False):
     if pct > 0.10:
         return "减仓" if held else "观望"     # 掉出前 10%，趋势弱化
     if ret5 > 6:
-        return "继续持有"                     # 加速中，持有但不追
-    return "买入"                             # 趋势健康
+        return "继续持有" if held else "加速中，别追"   # 涨太快，没买的别追
+    return "继续持有" if held else "买入"             # 趋势健康：手里的是拿住，空手的是建仓
 
 
 def backtest(rows, hold=20, rounds=6):
@@ -324,6 +367,27 @@ def quote(codes):
     return out
 
 
+def time_progress(dt=None):
+    """按 A 股 U 型成交节奏，估算此刻理论上应完成全天成交量的占比(0~1)。
+    早盘判断「是否放量」必须跟这个比，而不是跟 100% 比 —— 9:52 只过了 22 分钟，
+    成交额本该只有全天的两成，拿 60% 当门槛等于这条规则永远不触发。"""
+    dt = dt or NOW
+    t = dt.hour * 60 + dt.minute
+    if t < 9 * 60 + 30:
+        return 0.0
+    if t > 15 * 60:
+        return 1.0
+    if 11 * 60 + 30 < t < 13 * 60:
+        return 0.55                      # 午休，按上午收盘时的进度
+    el = (t - (9 * 60 + 30)) if t <= 11 * 60 + 30 else 120 + (t - 13 * 60)
+    el = min(max(el, 0), 240)
+    pts = [(0, 0.0), (30, 0.25), (120, 0.55), (210, 0.80), (240, 1.0)]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        if x0 <= el <= x1:
+            return y0 + (y1 - y0) * (el - x0) / (x1 - x0)
+    return 1.0
+
+
 def prev_amount(code):
     """昨日成交额（元），用来算今天开盘至今的量能进度"""
     rows = hist(code, 40)   # 不能取太少：数据源有「少于 30 根判无效」的保护
@@ -344,29 +408,34 @@ def judge_morning(q, cost, y_amt):
     chg = (price / prev - 1) * 100
     pnl = (price / cost - 1) * 100 if cost > 0 else None
     fall = (hi - price) / hi * 100 if hi > 0 else 0.0
-    vr = q["amount"] / y_amt * 100 if y_amt > 0 else 0.0
+    vr = q["amount"] / y_amt if y_amt > 0 else 0.0      # 今日已成量 / 昨日全天
+    ep = time_progress()
+    pace = vr / ep if ep > 0.02 else 0.0                 # 相对正常节奏的倍数
 
     if pnl is not None and pnl <= -STOP_LOSS:
         return "全部卖出", "亏损 %.1f%%，触及止损线" % abs(pnl)
     if chg <= -SELL_BREAK:
         return "全部卖出", "跌破昨收 %.1f%%，低开低走" % abs(chg)
-    if vr >= 60 and chg <= -1.5:
-        return "全部卖出", "放量下跌，量能已到昨日 %d%%" % int(vr)
+    if chg <= -1.5 and pace >= 1.8:
+        # 只看「相对正常节奏」，不看绝对占比：14:00 成交 70% 是常态，
+        # 拿 60% 当门槛会在盘尾天天误报放量。
+        return "全部卖出", "放量下跌：量能已是正常节奏的 %.1f 倍" % pace
     if pnl is not None and pnl >= TAKE_ALL:
         return "全部卖出", "赚 %.1f%%，到位先落袋" % pnl
     if fall >= SELL_FALL:
-        return "全部卖出", "从最高回落 %.1f%%，冲高失败" % fall
+        return "全部卖出", "从当日高点 %.2f 回落 %.1f%%，上攻失败" % (hi, fall)
     if pnl is not None and pnl >= TAKE_HALF:
         return "卖出一半", "赚 %.1f%%，先锁一半" % pnl
-    return "继续持有", "涨 %.1f%%，形态没破" % chg
+    return "继续持有", "%s %.1f%%，形态没破" % ("涨" if chg >= 0 else "跌", abs(chg))
 
 
 def run_morning(holds):
     """早盘模式：只看持仓，给出卖 / 持决策"""
     if not holds:
-        push("%s 无持仓" % NOW.strftime("%m-%d"),
-             "## 早盘\n\nhold.txt 里没有记录，今天不用操作。\n\n"
-             "买入后记得把「代码,成本价,股数」写进去。")
+        if not push("%s 无持仓" % NOW.strftime("%m-%d"),
+                    "## 早盘\n\nhold.txt 里没有记录，今天不用操作。\n\n"
+                    "买入后记得把「代码,成本价,股数」写进去。"):
+            sys.exit(1)
         return
 
     codes = [h["code"] for h in holds]
@@ -375,10 +444,15 @@ def run_morning(holds):
         print("实时行情全部失败")
         sys.exit(1)
 
-    d0 = next(iter(qt.values()))["time"][:8]
-    if d0 != NOW.strftime("%Y%m%d"):
-        print("今日休市（行情日期 %s）" % d0)
-        push("%s 休市" % NOW.strftime("%m-%d"), "## 今天休市\n\n不开盘，不用操作。")
+    # 取所有持仓里最新的行情日期。只看第一只的话，它若停牌就会让整条推送变成「休市」，
+    # 其他该卖的股票就被漏掉了。
+    tms = [v["time"] for v in qt.values() if len(v.get("time", "")) >= 12]
+    qtime = max(tms) if tms else ""
+    if qtime[:8] != NOW.strftime("%Y%m%d"):
+        print("今日休市（行情日期 %s）" % qtime[:8])
+        if not push("%s 休市" % NOW.strftime("%m-%d"),
+                    "## 今天休市\n\n不开盘，不用操作。\n\n<sub>行情日期 %s</sub>" % qtime[:8]):
+            sys.exit(1)
         return
 
     rows, tcost, tval = [], 0.0, 0.0
@@ -386,7 +460,15 @@ def run_morning(holds):
         q = qt.get(h["code"])
         if not q:
             rows.append({"act": "无行情", "name": h["code"], "cost": h["cost"],
-                         "price": 0.0, "pnl": None, "why": "停牌或代码有误"})
+                         "price": 0.0, "pnl": None, "why": "代码有误或已退市"})
+            continue
+        if q.get("time", "")[:8] != qtime[:8]:
+            if h["cost"] > 0 and h["shares"] > 0 and q["price"] > 0:
+                tcost += h["cost"] * h["shares"]
+                tval += q["price"] * h["shares"]      # 停牌也按最后价计入总市值
+            rows.append({"act": "无行情", "name": q["name"], "cost": h["cost"],
+                         "price": q["price"], "pnl": None,
+                         "why": "停牌，最后成交 %s-%s" % (q["time"][4:6], q["time"][6:8])})
             continue
         act, why = judge_morning(q, h["cost"], prev_amount(h["code"]))
         pnl = (q["price"] / h["cost"] - 1) * 100 if h["cost"] > 0 else None
@@ -406,8 +488,7 @@ def run_morning(holds):
     body = []
     head = "%d 只要动" % len(act_rows) if act_rows else "全部继续持有"
     body.append("## 【早盘】%s\n" % head)
-    t0 = next(iter(qt.values()))["time"]
-    body.append("行情时间 **%s:%s**　盘中价，不是收盘价\n" % (t0[8:10], t0[10:12]))
+    body.append("行情时间 **%s:%s**　盘中价，不是收盘价\n" % (qtime[8:10], qtime[10:12]))
     if not act_rows:
         body.append("**今天什么都不用做，继续拿着。**\n")
 
@@ -416,8 +497,9 @@ def run_morning(holds):
         for r in act_rows:
             c_s = "%.2f" % r["cost"] if r["cost"] > 0 else "未填"
             p_s = "%+.1f%%" % r["pnl"] if r["pnl"] is not None else "—"
-            body.append("- **%s** %s　成本 %s → 现价 %.2f（%s）\n  %s"
-                        % (r["act"], r["name"], c_s, r["price"], p_s, r["why"]))
+            warn = "　⚠ 成本价可能填错，请核对" if (r["pnl"] or 0) > 100 or (r["pnl"] or 0) < -90 else ""
+            body.append("- **%s** %s　成本 %s → 现价 %.2f（%s）%s\n  %s"
+                        % (r["act"], r["name"], c_s, r["price"], p_s, warn, r["why"]))
 
     if keep_rows:
         body.append("\n**不用动的**\n")
@@ -487,12 +569,31 @@ def main():
             except Exception:
                 pass
     print("取数成功 %d / %d，耗时 %.0f 秒" % (len(rows), len(items), time.time() - t0))
+    used = set(SRC_FAIL)
+    print("数据源状态:", "  ".join(
+        "%s=%s" % (n, "熔断" if s_ban(n) else ("正常" if n in used else "未使用"))
+        for n, _ in SOURCES))
     raw_ok = len(rows)          # 过滤停牌前的成功数，用来判断数据是否完整
     if ERR:
         print("失败样例:", " | ".join(ERR))
     if not rows:
         print("所有数据源都失败")
         sys.exit(1)
+
+    # ---- 数据不完整就不发信号 ----
+    # 只取到一部分标的时，中位数和排名都建立在残缺样本上，推出去的是假信号。
+    # 宁可空一天，也不能让你照着错的数据下单。
+    if raw_ok < len(items) * COVER_MIN:
+        msg = ("## 【数据异常】今天不操作\n\n"
+               "只取到 **%d/%d** 只标的（%.0f%%），低于 %.0f%% 的安全线。\n\n"
+               "在这种样本上算出的排名和中位数都不可信，**今天不发选股信号**，"
+               "按原持仓继续，不做新买入。\n\n"
+               "<sub>环境已刷新，明天多半自动恢复；连续两天这样请告诉我。</sub>"
+               % (raw_ok, len(items), raw_ok * 100.0 / len(items), COVER_MIN * 100))
+        print(msg)
+        if not push("%s 数据异常，今日不操作" % NOW.strftime("%m-%d"), msg):
+            sys.exit(1)
+        return
 
     # ---- 停牌剔除：最后交易日明显落后的，买不到，不该进榜单 ----
     latest = max(datetime.strptime(r["last"][:10], "%Y-%m-%d") for r in rows)
@@ -526,7 +627,7 @@ def main():
     tag = "【%s】%s" % (level, advice)
     body.append("## %s\n" % tag)
     if raw_ok < len(items) * 0.95:
-        body.append("**⚠ 今天只取到 %d/%d 只数据，信号可能失真，建议以观察为主**\n"
+        body.append("**⚠ 今天只取到 %d/%d 只数据，排名可能略有偏差**\n"
                     % (raw_ok, len(items)))
     if max_buy == 0:
         body.append("**今天不建议买入任何股票。** 留着现金，等市场转暖。\n")
@@ -558,7 +659,7 @@ def main():
         mark = "**%s**" % g if g in ("买入", "卖出") else g
         body.append("| %s | %s | %s | %s | %+.2f%% | %+.2f%% | %.2f |"
                     % (mark, r["code"], r["name"], r["close"], r["mom"], r["ret5"], r["amt"]))
-    body.append("\n<sub>「观望」= 趋势已弱，没买的别追；「回避」= 趋势破了，不要碰；"
+    body.append("\n<sub>「观望」= 趋势已弱，没买的别追；「回避」= 趋势破了，不要碰；「加速中，别追」= 涨得太急，等回调；"
                 "「暂缓」= 今天整体不买</sub>")
 
     # ---- 策略自检：过去几期同样规则的实际收益 ----
