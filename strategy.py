@@ -658,16 +658,28 @@ def main():
         body.append("**每只不超过总资金 10%%，今天最多买 %d 只。**\n" % max_buy)
     body.append("全池动量中位数 **%+.2f%%**，上涨 %d/%d 只（%.0f%%）\n"
                 % (med, up, total, up * 100.0 / total))
-    if stale:
-        body.append("数据截至 **%s** 收盘 · 有效 %d 只（剔除停牌 %d 只）\n"
-                    % (latest.strftime("%m-%d"), total, stale))
+    # 盘中跑（14:30）时不能写「收盘」——那时候还没收盘，写错会让人以为拿到的是定盘价
+    intraday = (latest.date() == NOW.date() and NOW.hour < 15)
+    if intraday:
+        stamp = "**%s %s 盘中价**" % (latest.strftime("%m-%d"), NOW.strftime("%H:%M"))
     else:
-        body.append("数据截至 **%s** 收盘 · %d/%d 只取数成功\n"
-                    % (latest.strftime("%m-%d"), total, len(items)))
+        stamp = "**%s** 收盘" % latest.strftime("%m-%d")
+    if stale:
+        body.append("数据截至 %s · 有效 %d 只（剔除停牌 %d 只）\n"
+                    % (stamp, total, stale))
+    else:
+        body.append("数据截至 %s · %d/%d 只取数成功\n"
+                    % (stamp, total, len(items)))
     if max_buy:
         n_pick = min(len(pick), max_buy)
         body.append("**今天买这 %d 只：%s**\n"
                     % (n_pick, "、".join(pick["name"].head(n_pick))))
+        if intraday:
+            mins = int((NOW.replace(hour=15, minute=0, second=0, microsecond=0)
+                        - NOW).total_seconds() // 60)
+            if mins > 0:
+                body.append("离收盘还有 **%d 分钟**，按现价挂单；表里的价是 %s 的，会变。\n"
+                            % (mins, NOW.strftime("%H:%M")))
 
     body += ["\n**今日目标组合**\n",
              "| 评级 | 代码 | 名称 | 现价 | 20日动量 | 5日涨幅 | 均额亿 |",
