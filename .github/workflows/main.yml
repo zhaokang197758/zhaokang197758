@@ -1,9 +1,8 @@
 name: daily-signal
 
 on:
-  schedule:
-    - cron: "0 2 * * 1-5"     # 北京 10:00 早盘：持仓该不该卖
-    - cron: "30 6 * * 1-5"    # 北京 14:30 收盘：选股 + 持仓诊断（备份通道，正常由定时任务触发）
+  # 定时不靠 GitHub 自己的 cron：实测会延迟 54 分钟以上，收盘后才推送等于废信号。
+  # 改由外部定时服务（WorkBuddy 定时任务）按点调用下面这个 dispatch 接口。
   workflow_dispatch:
     inputs:
       mode:
