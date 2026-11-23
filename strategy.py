@@ -176,6 +176,8 @@ def one(item):
     if close[-1] <= 0 or close[-1 - MOM_WIN] <= 0:
         return None
     return {"code": code, "name": name, "close": round(close[-1], 3),
+            "chg": round((close[-1] / close[-2] - 1) * 100, 2)
+                   if len(close) > 1 and close[-2] > 0 else 0.0,   # 今日涨跌幅，供「今天涨了多少」统计
             "mom": round((close[-1] / close[-1 - MOM_WIN] - 1) * 100, 2),
             "ret5": round((close[-1] / close[-6] - 1) * 100, 2),
             "amt": round(sum(amt[-20:]) / 20 / 1e8, 2),
@@ -656,8 +658,14 @@ def main():
         body.append("**弱市试仓：只买 %d 只，每只不超过总资金 5%%。**\n" % max_buy)
     else:
         body.append("**每只不超过总资金 10%%，今天最多买 %d 只。**\n" % max_buy)
-    body.append("全池动量中位数 **%+.2f%%**，上涨 %d/%d 只（%.0f%%）\n"
+    # 这两个数必须分开口径：「上涨 236/800」曾被读成「今天只有 236 只在涨」，
+    # 其实那是 20 日动量为正的只数。今天涨跌单独列一行，免得和市场行情对不上。
+    df["chg"] = df["chg"].fillna(0)
+    up_today = int((df["chg"] > 0).sum())
+    body.append("**20 日**动量中位数 **%+.2f%%**，动量为正 %d/%d 只（%.0f%%）\n"
                 % (med, up, total, up * 100.0 / total))
+    body.append("**今日**上涨 %d/%d 只（%.0f%%），中位数 %+.2f%%\n"
+                % (up_today, total, up_today * 100.0 / total, float(df["chg"].median())))
     # 盘中跑（14:30）时不能写「收盘」——那时候还没收盘，写错会让人以为拿到的是定盘价
     intraday = (latest.date() == NOW.date() and NOW.hour < 15)
     if intraday:
