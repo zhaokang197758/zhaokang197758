@@ -3,7 +3,7 @@ name: daily-signal
 on:
   schedule:
     - cron: "0 2 * * 1-5"     # 北京 10:00 早盘：持仓该不该卖
-    - cron: "15 6 * * 1-5"    # 北京 14:15 收盘：选股 + 持仓诊断
+    - cron: "30 6 * * 1-5"    # 北京 14:30 收盘：选股 + 持仓诊断（备份通道，正常由定时任务触发）
   workflow_dispatch:
     inputs:
       mode:
@@ -12,7 +12,7 @@ on:
         default: ""
 
 concurrency:
-  group: daily-signal-${{ github.event.schedule }}
+  group: daily-signal      # 固定组：外部触发的与备份定时器互斥，避免同时扫 800 只
   cancel-in-progress: false
 
 jobs:
