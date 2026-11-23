@@ -50,10 +50,10 @@ CRON = (os.getenv("CRON") or "").strip()
 _CP = CRON.split()
 if os.getenv("MODE"):
     MODE = os.getenv("MODE").strip()
-elif len(_CP) >= 2 and _CP[0] == "0" and _CP[1] == "2":
-    MODE = "morning"                    # 北京 10:00 那一档（UTC 02:00）
-elif len(_CP) >= 2 and _CP[0] == "15" and _CP[1] == "6":
-    MODE = "close"                      # 北京 14:15 那一档（UTC 06:15）
+elif len(_CP) >= 2 and _CP[1] == "2":
+    MODE = "morning"                    # 北京 10:xx（UTC 02:xx）
+elif len(_CP) >= 2 and _CP[1] == "6":
+    MODE = "close"                      # 北京 14:xx（UTC 06:xx）
 else:
     MODE = "morning" if NOW.hour < 12 else "close"
 KEY = (os.getenv("SERVERCHAN_SENDKEY") or "").strip()
