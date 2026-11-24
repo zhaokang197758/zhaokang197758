@@ -1,23 +1,31 @@
 name: daily-signal
 
 on:
-  # 定时不靠 GitHub 自己的 cron：实测会延迟 54 分钟以上，收盘后才推送等于废信号。
-  # 改由外部定时服务（WorkBuddy 定时任务）按点调用下面这个 dispatch 接口。
+  # 关键设计：不指望 GitHub 的 cron 准时。
+  # 实测它会在 3~60 分钟后才启动，所以让它「提前两小时」把机器叫起来，
+  # 由 strategy.py 自己 sleep 到 10:00 / 14:30 再跑。延迟多久都不影响准点。
+  schedule:
+    - cron: "0 0 * * 1-5"     # UTC 00:00 = 北京 08:00 起跑 -> 等到 10:00 执行早盘
+    - cron: "0 4 * * 1-5"     # UTC 04:00 = 北京 12:00 起跑 -> 等到 14:30 执行收盘
   workflow_dispatch:
     inputs:
       mode:
-        description: "morning=早盘 / close=收盘，留空按当前时间自动判断"
+        description: "morning=早盘 / close=收盘，留空按 cron 或当前时间判断"
         required: false
         default: ""
+      wait:
+        description: "auto=等到准点执行 / 0=立即执行（测试用）"
+        required: false
+        default: "auto"
 
 concurrency:
-  group: daily-signal      # 固定组：外部触发的与备份定时器互斥，避免同时扫 800 只
+  group: daily-signal      # 固定组：两个时点只能排队，不会同时扫 800 只
   cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 360    # 提前两小时起跑 + 等待，必须放宽，否则等待中会被杀
     steps:
       - uses: actions/checkout@v4
 
@@ -34,4 +42,5 @@ jobs:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
           MODE: ${{ github.event.inputs.mode }}
           CRON: ${{ github.event.schedule }}
+          WAIT: ${{ github.event.inputs.wait || 'auto' }}
         run: python strategy.py
