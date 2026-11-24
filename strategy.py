@@ -50,12 +50,18 @@ CRON = (os.getenv("CRON") or "").strip()
 _CP = CRON.split()
 if os.getenv("MODE"):
     MODE = os.getenv("MODE").strip()
-elif len(_CP) >= 2 and _CP[1] == "2":
-    MODE = "morning"                    # 北京 10:xx（UTC 02:xx）
-elif len(_CP) >= 2 and _CP[1] == "6":
-    MODE = "close"                      # 北京 14:xx（UTC 06:xx）
+elif len(_CP) >= 2 and _CP[1] in ("0", "2"):
+    MODE = "morning"                    # UTC 00/02 点起跑 -> 北京 10:00 执行早盘
+elif len(_CP) >= 2 and _CP[1] in ("4", "6"):
+    MODE = "close"                      # UTC 04/06 点起跑 -> 北京 14:30 执行收盘
 else:
     MODE = "morning" if NOW.hour < 12 else "close"
+
+# 准点由程序自己等，不指望定时器准时。
+# GitHub 自带 cron 实测会延迟 3-60 分钟，所以让它提前两小时把机器叫起来，
+# 程序 sleep 到目标时刻再开跑。这样延迟 59 分钟也照样 10:00 出结果。
+TARGET_HM = {"morning": (10, 0), "close": (14, 30)}
+WAIT = (os.getenv("WAIT") or "auto").strip().lower()
 KEY = (os.getenv("SERVERCHAN_SENDKEY") or "").strip()
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
@@ -569,7 +575,39 @@ def push(title, text):
     return False
 
 
+def wait_to_target():
+    """定时器只负责把机器叫起来；准点由程序自己等。
+    返回：实际等待的分钟数（0 = 没等）"""
+    global NOW
+    if WAIT in ("0", "no", "false", "off"):
+        return 0
+    hh, mm = TARGET_HM.get(MODE, (10, 0))
+    tz = ZoneInfo("Asia/Shanghai")
+    tgt = NOW.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    gap = (tgt - NOW).total_seconds()
+    if gap <= 20:
+        return 0
+    if gap > 10800:                     # 超过 3 小时不等，说明配错了，直接跑
+        print("距目标 %02d:%02d 还有 %.0f 分钟，超过上限，直接执行" % (hh, mm, gap / 60))
+        return 0
+    print("已启动，等待到 %02d:%02d 执行（还需 %.1f 分钟）" % (hh, mm, gap / 60), flush=True)
+    last = 0
+    while True:
+        remain = (tgt - datetime.now(tz)).total_seconds()
+        if remain <= 2:
+            break
+        time.sleep(min(max(remain - 1.5, 1), 120))
+        m = int(remain // 60)
+        if m >= 1 and m % 10 == 0 and m != last:   # 每 10 分钟打一次心跳，防日志静默
+            print("  ... 还有 %d 分钟" % m, flush=True)
+            last = m
+    NOW = datetime.now(tz)
+    print("到点，开始执行（%s）" % NOW.strftime("%H:%M:%S"), flush=True)
+    return int(gap // 60)
+
+
 def main():
+    wait_to_target()
     holds = read_hold()
     if MODE == "morning":
         run_morning(holds)
