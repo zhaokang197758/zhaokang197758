@@ -587,7 +587,7 @@ def wait_to_target():
     gap = (tgt - NOW).total_seconds()
     if gap <= 20:
         return 0
-    if gap > 10800:                     # 超过 3 小时不等，说明配错了，直接跑
+    if gap > 18000:                     # 超过 5 小时不等，说明配错了，直接跑
         print("距目标 %02d:%02d 还有 %.0f 分钟，超过上限，直接执行" % (hh, mm, gap / 60))
         return 0
     print("已启动，等待到 %02d:%02d 执行（还需 %.1f 分钟）" % (hh, mm, gap / 60), flush=True)
