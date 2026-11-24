@@ -743,7 +743,7 @@ def main():
 
     # ---- 策略自检：过去几期同样规则的实际收益 ----
     if bt:
-        body += ["", "**这套规则最近半年实际表现**（每 20 天换一次，含弱市空仓、未扣手续费）", ""]
+        body += ["", "**规则自检：最近 %d 期**（每 20 天一期，含弱市空仓、未扣手续费）" % len(bt), ""]
         for b in bt:
             if b.get("cash"):
                 body.append("- %d 天前 → **空仓**　当时全池 %+.1f%%，中位数 %+.1f%%"
@@ -756,6 +756,8 @@ def main():
         avgb = sum(b["bench"] for b in bt) / len(bt)
         body.append("- %d 期平均 **%+.1f%%**　全池 %+.1f%%　**%s %.1f 个点**（空仓期按 0%% 计）"
                     % (len(bt), avg, avgb, "跑赢" if avg > avgb else "跑输", abs(avg - avgb)))
+        body.append("<sub>⚠️ %d 期太少，正负几个点都在噪声里，别拿它当结论。"
+                    "用满 6 年、70 期数据跑出来的结果才勉强可信。</sub>" % len(bt))
 
     # ---- 持仓诊断 ----
     if holds:
